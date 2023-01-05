@@ -1,0 +1,1060 @@
+---
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r}
+library(tidyverse)
+library(mapview)
+library(sf)
+library(censusapi)
+library(tigris)
+library(gtools)
+options(tigris_use_cache = TRUE)
+Sys.setenv(CENSUS_KEY="c8aa67e4086b4b5ce3a8717f59faa9a28f611dab")
+```
+
+```{r}
+states <- states() %>% 
+  select(STUSPS, state = GEOID)
+```
+
+```{r}
+airports_geo <- st_read("https://services6.arcgis.com/ssFJjBXIUyZDrSYZ/arcgis/rest/services/US_Airport/FeatureServer/0/query?outFields=*&where=1%3D1&f=geojson")
+
+# https://www.faa.gov/sites/faa.gov/files/2022-09/NPIAS-2023-2027-Appendix-A.xlsx
+npias <- read_csv("G:/My Drive/RegLab/avgas/NPIAS-2023-2027-Appendix-A.csv")
+
+npias_ga <- npias %>% 
+  filter(`Svc Lvl\n(FY23)` %in% c("GA","R"))
+
+airports <- npias %>% 
+  left_join(airports_geo %>% select(LocID = IDENT)) %>%
+  st_as_sf() %>% 
+  left_join(
+    states %>% 
+      st_drop_geometry(), 
+    by = c("State" = "STUSPS")
+  ) %>% 
+  filter(!is.na(state))
+
+saveRDS(airports, "airports.rds")
+```
+
+```{r}
+# https://gaftp.epa.gov/air/nei/2017/data_summaries/2017v1/2017neiJan_facility_process_byregions.zip
+emissions1 <- read_csv("G:/My Drive/RegLab/avgas/point_12345.csv")
+emissions2 <- read_csv("G:/My Drive/RegLab/avgas/point_678910.csv")
+
+emissions_airport1 <- emissions1 %>% 
+  filter(`facility source type` == "Airport") %>% 
+  filter(`pollutant desc` == "Lead") %>% 
+  filter(`process description` == "Aircraft /General Aviation /Piston") %>% 
+  rename(
+    facility_id = `eis facility id`,
+    facility_name = `site name`,
+    lat = `site latitude`,
+    lon = `site longitude`
+  ) %>% 
+  group_by(facility_id, facility_name, lat, lon) %>% 
+  summarize(lead = max(`total emissions`)) %>% 
+  st_as_sf(coords = c("lon","lat"),crs = 4326)
+
+emissions_airport2 <- emissions2 %>% 
+  filter(facility_source_type == "Airport") %>% 
+  filter(pollutant_desc == "Lead") %>% 
+  filter(process_description == "Aircraft /General Aviation /Piston") %>% 
+  rename(
+    facility_id = eis_facility_id,
+    facility_name = site_name,
+    lat = site_latitude,
+    lon = site_longitude
+  ) %>% 
+  group_by(facility_id, facility_name, lat, lon) %>% 
+  summarize(lead = max(total_emissions)) %>% 
+  st_as_sf(coords = c("lon","lat"),crs = 4326)
+
+emissions_airport <- rbind(emissions_airport1, emissions_airport2) %>% 
+  filter(!grepl("hospital|medical", facility_name, ignore.case = T)) %>% 
+  st_transform(st_crs(summary_airport_map)) %>% 
+  ungroup() %>% 
+  mutate(nearest = row_number())
+
+saveRDS(emissions_airport, "G:/My Drive/RegLab/avgas/emissions_airport.rds")
+
+rm(emissions1,emissions2)
+
+emissions <- readRDS("emissions_airport.rds")
+
+airports_emissions <- airports %>% 
+  mutate(
+    nearest = st_nearest_feature(
+      airports,
+      emissions
+    )
+  ) %>% 
+  left_join(
+    emissions %>%
+      st_drop_geometry(),
+    by = "nearest"
+  ) %>% 
+  arrange(desc(lead)) %>% 
+  mutate(cumul_perc = cumsum(lead)/sum(lead))
+
+saveRDS(airports_emissions, "airports_emissions.rds")
+
+airports_emissions <- readRDS("airports_emissions.rds")
+```
+
+```{r}
+airports_emissions <- readRDS("airports_emissions.rds")
+
+ga_lead <- airports_emissions %>% 
+  filter(`Svc Lvl\n(FY23)` %in% c("GA","R"))
+
+ga_top350_lead <- airports_emissions %>% 
+  filter(`Svc Lvl\n(FY23)` %in% c("GA","R")) %>% 
+  arrange(desc(lead)) %>% 
+  mutate(cumul_perc = cumsum(lead)/sum(lead)) %>% 
+  head(350)
+
+sum(ga_top350_lead$lead)/sum(ga_lead$lead)
+```
+
+```{r}
+get_exposed <- function(airport){
+  
+  airports_1km <- airport %>% 
+    st_transform(26910) %>% 
+    st_buffer(1609.34) %>% 
+    st_transform(4269)
+  
+  airports_5km <- airport %>% 
+    st_transform(26910) %>% 
+    st_buffer(5*1609.34) %>% 
+    st_transform(4269)
+  
+  exposed_states <- states[airports_5km,]
+  
+  counties <- exposed_states$state %>% 
+    map_dfr(function(y){
+      
+      counties(y) %>% 
+        select(GEOID)
+      
+    })
+  
+  exposed_counties <- counties[airports_5km,]
+  
+  blocks <- exposed_counties$GEOID %>% 
+    map_dfr(function(z){
+      
+      blocks(substr(z,1,2), substr(z,3,5), year = "2020") %>% 
+        select(GEOID20)
+      
+    })
+  
+  cbgs <- exposed_counties$GEOID %>% 
+    map_dfr(function(z){
+      
+      block_groups(substr(z,1,2), substr(z,3,5), year = "2020") %>% 
+        select(GEOID)
+      
+    })
+  
+  exposed_blocks_5km <- blocks %>% 
+    .[airports_5km,] %>% 
+    mutate(original_area = as.numeric(st_area(.)))
+  
+  exposed_blocks_5km_intersect <- exposed_blocks_5km %>% 
+    st_intersection(airports_5km) %>% 
+    mutate(
+      leftover_5km = as.numeric(st_area(.))
+    )
+  
+  exposed_blocks_1km_intersect <- exposed_blocks_5km_intersect %>% 
+    select(-LocID) %>% 
+    st_intersection(airports_1km) %>% 
+    mutate(
+      leftover_1km = as.numeric(st_area(.))
+    ) %>% 
+    st_drop_geometry()
+  
+  exposed_blocks <- exposed_blocks_5km_intersect %>% 
+    left_join(exposed_blocks_1km_intersect %>% select(GEOID20, leftover_1km), by = "GEOID20") %>% 
+    st_drop_geometry()
+  
+  exposed_cbgs_5km <- cbgs %>% 
+    .[airports_5km,] %>% 
+    mutate(original_area = as.numeric(st_area(.)))
+  
+  exposed_cbgs_5km_intersect <- exposed_cbgs_5km %>% 
+    st_intersection(airports_5km) %>% 
+    mutate(
+      leftover_5km = as.numeric(st_area(.))
+    )
+  
+  exposed_cbgs_1km_intersect <- exposed_cbgs_5km_intersect %>% 
+    select(-LocID) %>% 
+    st_intersection(airports_1km) %>% 
+    mutate(
+      leftover_1km = as.numeric(st_area(.))
+    ) %>% 
+    st_drop_geometry()
+  
+  exposed_cbgs <- exposed_cbgs_5km_intersect %>% 
+    left_join(exposed_cbgs_1km_intersect %>% select(GEOID, leftover_1km), by = "GEOID") %>% 
+    st_drop_geometry()
+  
+  saveRDS(exposed_blocks, paste0("exposed_blocks/",airport$LocID,"_blocks.rds"))
+  saveRDS(exposed_cbgs, paste0("exposed_cbgs/",airport$LocID,"_cbgs.rds"))
+  
+}
+```
+
+```{r}
+for(x in 1:nrow(airports)){
+  
+  print(x)
+  
+  airport <- airports[x,] %>% 
+    select(LocID)
+  
+  tryCatch(
+    get_exposed(airport),
+    error = function(e){
+      print("error")
+    }
+  )
+  
+}
+```
+
+```{r}
+exposed_blocks <- list.files("exposed_blocks/", full.names=T) %>% 
+  map_dfr(readRDS)
+
+exposed_area <- exposed_blocks %>% 
+  group_by(LocID) %>% 
+  summarize(area = sum(original_area))
+
+saveRDS(exposed_area, "exposed_area.rds")
+
+unique_counties <- exposed_blocks %>% 
+  mutate(county = substr(GEOID20,1,5)) %>% 
+  filter(!duplicated(county))
+
+block_pop_race_2020 <- NULL
+county_pop_race_2020 <- NULL
+
+for(x in 1:nrow(unique_counties)){
+    
+  print(x)
+  
+  county <- substr(unique_counties$county[x],3,5)
+  state <- substr(unique_counties$county[x],1,2)
+  
+  tryCatch({
+    temp <- 
+      getCensus(
+        name = "dec/pl",
+        vintage = 2020,
+        region = paste0("block:*"), 
+        regionin = paste0("state:",state,"+county:",county),
+        vars = c(
+          "P2_001N",
+          "P2_002N",
+          "P2_005N",
+          "P2_006N",
+          "P2_007N",
+          "P2_008N",
+          "P2_009N",
+          "P2_010N",
+          "P2_011N",
+          "P4_001N",
+          "P4_002N",
+          "P4_005N",
+          "P4_006N",
+          "P4_007N",
+          "P4_008N",
+          "P4_009N",
+          "P4_010N",
+          "P4_011N"
+        )
+      ) %>% 
+      unite(GEOID20, state, county, tract, block, sep = "")
+    
+    block_pop_race_2020 <- block_pop_race_2020 %>% 
+      rbind(
+        temp %>% 
+        filter(GEOID20 %in% exposed_blocks$GEOID20)
+      )
+    
+    county_pop_race_2020 <- county_pop_race_2020 %>% 
+      rbind(
+        temp %>% 
+          mutate(county = substr(GEOID20,1,5)) %>% 
+          select(-GEOID20) %>% 
+          group_by(county) %>% 
+          summarize_all(sum)
+      )
+    
+    if(x%%1000==0){
+      saveRDS(block_pop_race_2020, "block_pop_race_2020.rds")
+      saveRDS(county_pop_race_2020, "county_pop_race_2020.rds")
+    } 
+    
+    },
+    error = function(e) NULL
+  )
+  
+}
+
+saveRDS(block_pop_race_2020, "block_pop_race_2020.rds")
+saveRDS(county_pop_race_2020, "county_pop_race_2020.rds")
+```
+
+```{r}
+exposed_cbgs <- list.files("exposed_cbgs/", full.names=T) %>% 
+  map_dfr(readRDS)
+
+unique_counties <- exposed_cbgs %>% 
+  mutate(county = substr(GEOID,1,5)) %>% 
+  filter(!duplicated(county))
+
+cbg_income_2021 <- NULL
+county_income_2021 <- NULL
+
+for(x in 1:nrow(unique_counties)){
+    
+  print(x)
+  
+  county <- substr(unique_counties$county[x],3,5)
+  state <- substr(unique_counties$county[x],1,2)
+  
+  tryCatch({
+    temp <- getCensus(
+      name = "acs/acs5",
+      vintage = 2021,
+      region = paste0("block group:*"), 
+      regionin = paste0("state:",state,"+county:",county),
+      vars = c(
+        "B19001_001E",
+        "B19001_002E",
+        "B19001_003E",
+        "B19001_004E",
+        "B19001_005E",
+        "B19001_006E",
+        "B19001_007E",
+        "B19001_008E",
+        "B19001_009E",
+        "B19001_010E",
+        "B19001_011E",
+        "B19001_012E"
+      )
+    ) %>% 
+      unite(GEOID, state, county, tract, block_group, sep = "")
+    
+    cbg_income_2021 <- cbg_income_2021 %>% 
+      rbind(
+        temp %>% 
+        filter(GEOID %in% exposed_cbgs$GEOID)
+      )
+    
+    county_income_2021 <- county_income_2021 %>% 
+      rbind(
+        temp %>% 
+          mutate(county = substr(GEOID,1,5)) %>% 
+          select(-GEOID) %>% 
+          group_by(county) %>% 
+          summarize_all(sum)
+      )
+    
+    if(x%%1000==0){
+      saveRDS(cbg_income_2021, "cbg_income_2021.rds")
+      saveRDS(county_income_2021, "county_income_2021.rds")
+    } 
+    
+    },
+    error = function(e) NULL
+  )
+    
+}
+
+saveRDS(cbg_income_2021, "cbg_income_2021.rds")
+saveRDS(county_income_2021, "county_income_2021.rds")
+```
+
+```{r}
+exposed_blocks_join <- exposed_blocks %>% 
+  left_join(
+    block_pop_race_2020, 
+    by = "GEOID20"
+  ) %>% 
+  filter(!is.na(P2_001N)) %>% 
+  mutate(
+    county = substr(GEOID20,1,5)
+  )
+
+exposed_blocks_join_summary <- rbind(
+  exposed_blocks_join %>% 
+    filter(!duplicated(paste(LocID, county))) %>% 
+    select(LocID, county) %>% 
+    left_join(county_pop_race_2020) %>% 
+    select(-county) %>% 
+    group_by(LocID) %>% 
+    summarize_all(sum) %>% 
+    mutate(type = "county"),
+  exposed_blocks_join %>% 
+    select(LocID, starts_with("P")) %>% 
+    group_by(LocID) %>% 
+    summarize_all(sum) %>% 
+    mutate(type = "5km_full"),
+  exposed_blocks_join %>% 
+    mutate(across(
+      P2_001N:P4_011N,
+      ~(.*leftover_5km/original_area)
+    )) %>% 
+    select(LocID, starts_with("P")) %>% 
+    group_by(LocID) %>% 
+    summarize_all(sum) %>% 
+    mutate(type = "5km_crop"),
+  exposed_blocks_join %>% 
+    filter(is.na(leftover_1km)) %>% 
+    select(LocID, starts_with("P")) %>% 
+    group_by(LocID) %>% 
+    summarize_all(sum) %>% 
+    mutate(type = "1to5km_full"),
+  exposed_blocks_join %>% 
+    mutate(leftover_1km = leftover_1km %>% replace_na(0)) %>% 
+    mutate(across(
+      P2_001N:P4_011N,
+      ~(.*(leftover_5km-leftover_1km)/original_area)
+    )) %>% 
+    select(LocID, starts_with("P")) %>% 
+    group_by(LocID) %>% 
+    summarize_all(sum) %>% 
+    mutate(type = "1to5km_crop"),
+  exposed_blocks_join %>% 
+    filter(!is.na(leftover_1km)) %>% 
+    select(LocID, starts_with("P")) %>% 
+    group_by(LocID) %>% 
+    summarize_all(sum) %>% 
+    mutate(type = "1km_full"),
+  exposed_blocks_join %>% 
+    filter(!is.na(leftover_1km)) %>% 
+    mutate(across(
+      P2_001N:P4_011N,
+      ~(.*leftover_1km/original_area)
+    )) %>% 
+    select(LocID, starts_with("P")) %>% 
+    group_by(LocID) %>% 
+    summarize_all(sum) %>% 
+    mutate(type = "1km_crop")
+)
+
+exposed_cbgs_join <- exposed_cbgs %>% 
+  left_join(
+    cbg_income_2021, 
+    by = "GEOID"
+  ) %>% 
+  filter(!is.na(B19001_001E)) %>% 
+  mutate(
+    county = substr(GEOID,1,5)
+  )
+
+exposed_cbgs_join_summary <- rbind(
+  exposed_cbgs_join %>% 
+    filter(!duplicated(paste(LocID, county))) %>% 
+    select(LocID, county) %>% 
+    left_join(county_income_2021) %>% 
+    select(-county) %>% 
+    group_by(LocID) %>% 
+    summarize_all(sum) %>% 
+    mutate(type = "county"),
+  exposed_cbgs_join %>% 
+    select(LocID, starts_with("B")) %>% 
+    group_by(LocID) %>% 
+    summarize_all(sum) %>% 
+    mutate(type = "5km_full"),
+  exposed_cbgs_join %>% 
+    mutate(across(
+      B19001_001E:B19001_012E,
+      ~(.*leftover_5km/original_area)
+    )) %>% 
+    select(LocID, starts_with("B")) %>% 
+    group_by(LocID) %>% 
+    summarize_all(sum) %>% 
+    mutate(type = "5km_crop"),
+  exposed_cbgs_join %>% 
+    filter(is.na(leftover_1km)) %>% 
+    select(LocID, starts_with("B")) %>% 
+    group_by(LocID) %>% 
+    summarize_all(sum) %>% 
+    mutate(type = "1to5km_full"),
+  exposed_cbgs_join %>% 
+    mutate(leftover_1km = leftover_1km %>% replace_na(0)) %>% 
+    mutate(across(
+      B19001_001E:B19001_012E,
+      ~(.*(leftover_5km-leftover_1km)/original_area)
+    )) %>% 
+    select(LocID, starts_with("B")) %>% 
+    group_by(LocID) %>% 
+    summarize_all(sum) %>% 
+    mutate(type = "1to5km_crop"),
+  exposed_cbgs_join %>% 
+    filter(!is.na(leftover_1km)) %>% 
+    select(LocID, starts_with("B")) %>% 
+    group_by(LocID) %>% 
+    summarize_all(sum) %>% 
+    mutate(type = "1km_full"),
+  exposed_cbgs_join %>% 
+    filter(!is.na(leftover_1km)) %>% 
+    mutate(across(
+      B19001_001E:B19001_012E,
+      ~(.*leftover_1km/original_area)
+    )) %>% 
+    select(LocID, starts_with("B")) %>% 
+    group_by(LocID) %>% 
+    summarize_all(sum) %>% 
+    mutate(type = "1km_crop")
+)
+
+exposed_final <- exposed_blocks_join_summary %>% 
+  left_join(
+    exposed_cbgs_join_summary,
+    by = c("LocID","type")
+  ) %>% 
+  transmute(
+    LocID,
+    type,
+    pop = P2_001N,
+    hispanic = P2_002N,
+    white = P2_005N,
+    black = P2_006N,
+    aian = P2_007N,
+    asian = P2_008N,
+    nhpi = P2_009N,
+    other = P2_010N + P2_011N,
+    y_pop = pop - P4_001N,
+    y_hispanic = hispanic - P4_002N,
+    y_white = white - P4_005N,
+    y_black = black - P4_006N,
+    y_aian = aian - P4_007N,
+    y_asian = asian - P4_008N,
+    y_nhpi = nhpi- P4_009N,
+    y_other = other - (P4_010N + P4_011N),
+    hh = B19001_001E,
+    less10k = B19001_002E,
+    less15k = less10k+B19001_003E,
+    less20k = less15k+B19001_004E,
+    less25k = less20k+B19001_005E,
+    less30k = less25k+B19001_006E,
+    less35k = less30k+B19001_007E,
+    less40k = less35k+B19001_008E,
+    less45k = less40k+B19001_009E,
+    less50k = less45k+B19001_010E,
+    less60k = less50k+B19001_011E,
+    less75k = less60k+B19001_012E
+  )
+
+saveRDS(exposed_final, "exposed_final.rds")
+exposed_final <- readRDS("exposed_final.rds")
+```
+
+```{r}
+ga_density <- ga_lead %>% 
+  left_join(
+    exposed_final %>% 
+      filter(type == "1km_crop") %>% 
+      select(LocID, pop)
+  )
+
+ga_top121_density <- ga_density %>% 
+  arrange(desc(pop)) %>% 
+  mutate(cumul_pop = cumsum(pop)/sum(pop,na.rm=T)) %>% 
+  head(121)
+
+ga_4x4 <- ga_density %>% 
+  filter(!is.na(pop)) %>%
+  mutate(
+    pop = round(pop),
+    lead = round(lead)
+  ) %>% 
+  filter(pop > 100) %>% 
+  left_join(exposed_area) %>% 
+  mutate(
+    density = pop/area*2590000,
+    density_quartile = quantcut(density),
+    lead_quartile = quantcut(lead)
+  )
+
+ga_20x20 <- ga_density %>% 
+  filter(!is.na(pop)) %>%
+  mutate(
+    pop = round(pop),
+    lead = round(lead)
+  ) %>% 
+  filter(pop > 100) %>% 
+  left_join(exposed_area) %>% 
+  mutate(
+    density = pop/area*2590000,
+    density_quartile = quantcut(density, 20),
+    lead_quartile = quantcut(lead, 20)
+  )
+
+top302 <- ga_4x4 %>% 
+  filter(density_quartile == "(16.9,2.54e+03]") %>% 
+  filter(lead_quartile == "(139,1.49e+03]")
+
+top35 <- ga_20x20 %>% 
+  filter(density_quartile == "(76.1,2.54e+03]") %>% 
+  filter(lead_quartile == "(388,1.49]")
+
+sample <- ga_4x4 %>% 
+  sample_n(50) %>% 
+  select(State, City, Airport, facility_name)
+
+exposed_4x4 <- exposed_final %>% 
+  left_join(
+    ga_4x4 %>% select(LocID, density_quartile, lead_quartile)
+  ) %>% 
+  filter(!is.na(lead_quartile)) %>% 
+  select(-geometry) %>% 
+  filter(type %in% c("county","1km_full","1km_crop"))
+```
+
+```{r}
+us_pop_race_2020 <- getCensus(
+  name = "dec/pl",
+  vintage = 2020,
+  region = "us", 
+  vars = c(
+    "P2_001N",
+    "P2_002N",
+    "P2_005N",
+    "P2_006N",
+    "P2_007N",
+    "P2_008N",
+    "P2_009N",
+    "P2_010N",
+    "P2_011N",
+    "P4_001N",
+    "P4_002N",
+    "P4_005N",
+    "P4_006N",
+    "P4_007N",
+    "P4_008N",
+    "P4_009N",
+    "P4_010N",
+    "P4_011N"
+  )
+)
+
+us_income_2021 <- getCensus(
+  name = "acs/acs5",
+  vintage = 2021,
+  region = "us", 
+  vars = c(
+    "B19001_001E",
+    "B19001_002E",
+    "B19001_003E",
+    "B19001_004E",
+    "B19001_005E",
+    "B19001_006E",
+    "B19001_007E",
+    "B19001_008E",
+    "B19001_009E",
+    "B19001_010E",
+    "B19001_011E",
+    "B19001_012E"
+  )
+)
+```
+
+```{r}
+us_final <- us_pop_race_2020 %>% 
+  left_join(us_income_2021) %>% 
+  transmute(
+    type = "USA",
+    pop = P2_001N,
+    hispanic = P2_002N,
+    white = P2_005N,
+    black = P2_006N,
+    aian = P2_007N,
+    asian = P2_008N,
+    nhpi = P2_009N,
+    other = P2_010N + P2_011N,
+    y_pop = pop - P4_001N,
+    y_hispanic = hispanic - P4_002N,
+    y_white = white - P4_005N,
+    y_black = black - P4_006N,
+    y_aian = aian - P4_007N,
+    y_asian = asian - P4_008N,
+    y_nhpi = nhpi- P4_009N,
+    y_other = other - (P4_010N + P4_011N),
+    hh = B19001_001E,
+    less10k = B19001_002E,
+    less15k = less10k+B19001_003E,
+    less20k = less15k+B19001_004E,
+    less25k = less20k+B19001_005E,
+    less30k = less25k+B19001_006E,
+    less35k = less30k+B19001_007E,
+    less40k = less35k+B19001_008E,
+    less45k = less40k+B19001_009E,
+    less50k = less45k+B19001_010E,
+    less60k = less50k+B19001_011E,
+    less75k = less60k+B19001_012E
+  )
+
+saveRDS(us_final, "us_final.rds")
+```
+
+```{r}
+summary_us <- exposed_4x4 %>% 
+  filter(type %in% c("1km_crop","1km_full")) %>% 
+  group_by(type, density_quartile, lead_quartile) %>% 
+  summarize(
+    count = length(unique(LocID)),
+    across(
+      pop:less75k,
+      ~sum(.,na.rm=T)
+    )
+  ) %>% 
+  mutate(
+    across(
+      hispanic:y_other,
+      ~(./pop)
+    ),
+    across(
+      less10k:less75k,
+      ~(./hh)
+    ),
+    nonwhite = (1-white)
+  ) %>% 
+  pivot_longer(
+    -c(type, density_quartile, lead_quartile),
+    names_to = "name",
+    values_to = "value"
+  ) %>% 
+  pivot_wider(
+    names_from = "type",
+    values_from = "value"
+  ) %>% 
+  left_join(
+    us_final %>% 
+      mutate(
+        across(
+          hispanic:y_other,
+          ~(./pop)
+        ),
+        across(
+          less10k:less75k,
+          ~(./hh)
+        ),
+        nonwhite = 1-white
+      ) %>% 
+      select(-type) %>% 
+      pivot_longer(
+        everything(),
+        names_to = "name",
+        values_to = "usa"
+      )
+  ) %>% 
+  mutate(
+    perc_diff_crop = round((`1km_crop`/usa),1),
+    perc_diff_full = round((`1km_full`/usa),1)
+  ) %>% 
+  mutate(
+    low = pmin(`1km_crop`,`1km_full`),
+    high = pmax(`1km_crop`,`1km_full`)
+  )
+
+table1 <- summary_us %>% 
+  filter(name == "count") %>% 
+  select(name,density_quartile, lead_quartile, `1km_full`) %>% 
+  pivot_wider(
+    names_from = "density_quartile",
+    values_from = "1km_full"
+  )
+
+write.table(table1, "clipboard", sep = "\t")
+
+table2 <- summary_us %>% 
+  filter(name == "pop") %>% 
+  mutate(
+    value = paste0(prettyNum(signif(low,2),","),"-",prettyNum(signif(high,2),","))
+  ) %>% 
+  select(name,density_quartile, lead_quartile, value) %>% 
+  pivot_wider(
+    names_from = "density_quartile",
+    values_from = "value"
+  )
+
+write.table(table2, "clipboard", sep = "\t", row.names=F)
+```
+
+```{r}
+table3 <- summary_us %>% 
+  filter(name == "nonwhite") %>% 
+  mutate(
+    value = paste0(prettyNum(signif(low*100,2),","),"-",prettyNum(signif(high*100,2),","),"%")
+  ) %>% 
+  select(name,density_quartile, lead_quartile, value) %>% 
+  pivot_wider(
+    names_from = "density_quartile",
+    values_from = "value"
+  )
+
+write.table(table3, "clipboard", sep = "\t", row.names=F)
+
+table4 <- summary_us %>% 
+  filter(name == "less75k") %>% 
+  mutate(
+    value = paste0(prettyNum(signif(low*100,2),","),"-",prettyNum(signif(high*100,2),","),"%")
+  ) %>% 
+  select(name,density_quartile, lead_quartile, value) %>% 
+  pivot_wider(
+    names_from = "density_quartile",
+    values_from = "value"
+  )
+
+write.table(table4, "clipboard", sep = "\t", row.names=F)
+```
+
+```{r}
+summary_county <- 
+  exposed_4x4 %>% 
+  group_by(density_quartile, lead_quartile, type) %>% 
+  mutate(
+    across(
+      hispanic:y_other,
+      ~(./pop)
+    ),
+    across(
+      less10k:less75k,
+      ~(./hh)
+    ),
+    nonwhite = 1-white
+  ) %>% 
+  pivot_longer(
+    -c(LocID,type, density_quartile, lead_quartile),
+    names_to = "name",
+    values_to = "value"
+  ) %>% 
+  pivot_wider(
+    names_from = "type",
+    values_from = "value"
+  ) %>% 
+  mutate(
+    perc_diff_crop = (`1km_crop` - county)*100,
+    perc_diff_full = (`1km_full` - county)*100
+  ) %>% 
+  group_by(density_quartile, lead_quartile, name) %>% 
+  select(-LocID) %>% 
+  summarize(
+    total = n(),
+    perc_exceed_crop = sum(perc_diff_crop>0, na.rm=T)/n()*100,
+    perc_exceed_full = sum(perc_diff_full>0, na.rm=T)/n()*100
+  ) %>% 
+  ungroup() %>% 
+  mutate(
+    low = pmin(perc_exceed_crop,perc_exceed_full),
+    high = pmax(perc_exceed_crop,perc_exceed_full)
+  )
+
+table5 <- summary_county %>% 
+  filter(name == "nonwhite") %>% 
+  mutate(
+    value = paste0(prettyNum(signif(low,2),","),"-",prettyNum(signif(high,2),","),"%")
+  ) %>% 
+  select(name,density_quartile, lead_quartile, value) %>% 
+  pivot_wider(
+    names_from = "density_quartile",
+    values_from = "value"
+  )
+
+write.table(table5, "clipboard", sep = "\t", row.names=F)
+```
+
+```{r}
+table6 <- summary_county %>% 
+  filter(name == "less75k") %>% 
+  mutate(
+    value = paste0(prettyNum(signif(low,2),","),"-",prettyNum(signif(high,2),","),"%")
+  ) %>% 
+  select(name,density_quartile, lead_quartile, value) %>% 
+  pivot_wider(
+    names_from = "density_quartile",
+    values_from = "value"
+  )
+
+write.table(table6, "clipboard", sep = "\t",row.names=F)
+```
+
+```{r}
+table7 <- ga_4x4 %>% 
+  filter(density_quartile == "(76.1,2.54e+03]") %>% 
+  filter(lead_quartile == "(388,1.49]") %>% 
+  transmute(
+    State,
+    City,
+    Airport,
+    ID = LocID,
+    Lead = signif(lead, 2),
+    Density = signif(density, 2)
+  ) %>% 
+  arrange(State, Airport)
+
+write.table(table7, "clipboard", sep = "\t",row.names=F)
+```
+
+```{r}
+summary1 <- us_final %>% 
+  rbind(
+    exposed_final %>% 
+      filter(LocID %in% ga_4x4$LocID) %>% # replace ga_4x4 with ga_top350_lead, ga_top121_density, and top35 to fully produce table 8 
+      group_by(type) %>% 
+      summarize(across(
+        pop:less75k,
+        ~sum(.,na.rm=T)
+      ))
+  )
+
+summary2 <- summary1 %>% 
+  mutate(
+    across(
+      hispanic:y_other,
+      ~(./pop)
+    ),
+    across(
+      less10k:less75k,
+      ~(./hh)
+    ),
+    nonwhite = (1-white)
+  )
+
+summary3 <- summary2 %>% 
+  filter(type %in% c("USA","1km_crop","1km_full")) %>% 
+  pivot_longer(
+    -type,
+    names_to = "name",
+    values_to = "value"
+  ) %>% 
+  pivot_wider(
+    names_from = "type",
+    values_from = "value"
+  ) %>% 
+  mutate(
+    perc_diff_crop = `1km_crop`/USA,
+    perc_diff_full = `1km_full`/USA
+  )
+```
+
+```{r}
+summary4 <- 
+  exposed_final %>% 
+  filter(LocID %in% top35$LocID) %>% 
+  mutate(
+    across(
+      hispanic:y_other,
+      ~(./pop)
+    ),
+    across(
+      less10k:less75k,
+      ~(./hh)
+    ),
+    nonwhite = 1-white
+  ) %>% 
+  pivot_longer(
+    -c(LocID,type),
+    names_to = "name",
+    values_to = "value"
+  ) %>% 
+  pivot_wider(
+    names_from = "type",
+    values_from = "value"
+  ) %>% 
+  left_join(
+    us_final %>% 
+      mutate(
+        across(
+          hispanic:y_other,
+          ~(./pop)
+        ),
+        across(
+          less10k:less75k,
+          ~(./hh)
+        ),
+        nonwhite = 1-white
+      ) %>% 
+      select(-type) %>% 
+      pivot_longer(
+        everything(),
+        names_to = "name",
+        values_to = "usa"
+      )
+  )
+
+summary5a <- summary4 %>% 
+  select(LocID,name, `1km_crop`,everything()) %>% 
+  mutate(
+    across(
+      county:usa,
+      ~((`1km_crop` - .)*100)
+    )
+  )
+
+summary6a <- summary5a %>%
+  select(-LocID) %>% 
+  group_by(name) %>% 
+  summarize_all(~sum(.>0, na.rm=T))
+
+summary7a <- summary5a %>%
+  select(-LocID) %>% 
+  group_by(name) %>% 
+  summarize_all(~sum(.>0 & . < 10, na.rm=T))
+
+summary8a <- summary5a %>%
+  select(-LocID) %>% 
+  group_by(name) %>% 
+  summarize_all(~sum(.>=10 & . < 20, na.rm=T))
+
+summary9a <- summary5a %>%
+  select(-LocID) %>% 
+  group_by(name) %>% 
+  summarize_all(~sum(.>=20, na.rm=T))
+```
+
+```{r}
+summary5b <- summary4 %>% 
+  select(LocID,name, `1km_full`,everything()) %>% 
+  mutate(
+    across(
+      county:usa,
+      ~((`1km_full` - .)*100)
+    )
+  )
+
+summary6b <- summary5b %>%
+  select(-LocID) %>% 
+  group_by(name) %>% 
+  summarize_all(~sum(.>0, na.rm=T))
+
+summary7b <- summary5b %>%
+  select(-LocID) %>% 
+  group_by(name) %>% 
+  summarize_all(~sum(.>0 & . < 10, na.rm=T))
+
+summary8b <- summary5b %>%
+  select(-LocID) %>% 
+  group_by(name) %>% 
+  summarize_all(~sum(.>=10 & . < 20, na.rm=T))
+
+summary9b <- summary5b %>%
+  select(-LocID) %>% 
+  group_by(name) %>% 
+  summarize_all(~sum(.>=20, na.rm=T))
+```
+
